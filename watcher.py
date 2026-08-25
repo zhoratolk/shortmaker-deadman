@@ -142,7 +142,11 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.status == 200
     except Exception as e:
-        print(f"watcher: could not reach Telegram: {e}", file=sys.stderr)
+        # The exception type only, never its message: a malformed URL is reported by
+        # quoting the whole URL back, and the whole URL contains the bot token. Actions
+        # masks known secrets in its own log, but stderr is copied into artifacts and
+        # pasted into chats where nothing masks anything.
+        print(f"watcher: could not reach Telegram: {type(e).__name__}", file=sys.stderr)
         return False
 
 
@@ -160,6 +164,41 @@ def save_state(path: str, state: dict) -> None:
         f.write("\n")
 
 
+def _record(state_path: str, status: str, changed_at: int, now: float,
+            announced: bool) -> None:
+    save_state(state_path, {
+        "status": status,
+        "changed_at": changed_at,
+        "keepalive": int(now),
+        # Whether the person was actually told. A state remembered as announced when the
+        # message never left means the next run sees no change and says nothing - the
+        # outage goes unreported for as long as it lasts.
+        "announced": announced,
+    })
+
+
+def _keepalive_only(state_path: str, previous: dict, now: float) -> bool:
+    """Touches the file just to prove the repository is still alive, if it is due.
+
+    Called on the paths that end early. Without it a fault that lasts - a deleted gist, an
+    expired token, a rate limit - stops every commit, and sixty quiet days later GitHub
+    disables the schedule. The watchman would stop showing up precisely because something
+    was wrong, which is the failure this whole file exists to prevent.
+    """
+    if now - previous.get("keepalive", 0) <= KEEPALIVE_SECONDS:
+        return False
+    _record(state_path, previous.get("status", OK), previous.get("changed_at", int(now)),
+            now, previous.get("announced", True))
+    return True
+
+
+def _tell_workflow(writing: bool) -> None:
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as f:
+            f.write(f"commit={'true' if writing else 'false'}\n")
+
+
 def main() -> int:
     gist_id = setting("GIST_ID")
     gist_token = setting("GIST_TOKEN")
@@ -170,42 +209,60 @@ def main() -> int:
 
     if not gist_id:
         print("watcher: GIST_ID is not set", file=sys.stderr)
+        _tell_workflow(False)
         return 2
 
     previous = load_state(state_path)
 
-    # A gist that cannot be read is itself a kind of silence, but it is our silence rather
-    # than the server's - saying so plainly beats reporting a power cut that never was.
+    # Reading the gist and reading what is in it are different failures. Not reaching
+    # GitHub is our silence, and claiming a power cut on it would be a lie. A file we did
+    # read whose contents are nonsense is the server's silence: it died mid-write, or its
+    # disk filled - exactly the case this was built for, so it counts as down.
     try:
-        stamp, verdict = parse_beat(read_beat(gist_id, gist_token))
+        raw = read_beat(gist_id, gist_token)
     except Exception as e:
-        print(f"watcher: cannot read the heartbeat: {e}", file=sys.stderr)
+        print(f"watcher: cannot reach the heartbeat: {type(e).__name__}", file=sys.stderr)
+        _tell_workflow(_keepalive_only(state_path, previous, now))
         return 1
 
-    age = max(0.0, now - stamp)
-    current = classify(age, verdict)
-    changed = should_announce(previous.get("status", OK), current)
+    try:
+        stamp, verdict = parse_beat(raw)
+        age = max(0.0, now - stamp)
+        current = classify(age, verdict)
+    except ValueError as e:
+        print(f"watcher: the heartbeat is unreadable, treating it as down: {e}",
+              file=sys.stderr)
+        stamp, verdict, age, current = 0, "unreadable", 0.0, DOWN
+
+    was = previous.get("status", OK)
+    # An alarm that was never delivered is not an alarm. Re-announcing the same state is
+    # right here, unlike the fifteen-minute repeats this deliberately avoids: nobody has
+    # heard this one yet.
+    changed = should_announce(was, current) or not previous.get("announced", True)
 
     print(f"watcher: last beat {age / 60:.1f} min ago, verdict '{verdict}', state '{current}'")
 
-    if changed and bot_token and chat_id:
-        send_telegram(bot_token, chat_id, message(current, age / 60))
+    announced = True
+    if changed:
+        if bot_token and chat_id:
+            announced = send_telegram(bot_token, chat_id, message(current, age / 60))
+            if not announced:
+                print("watcher: the alert did not go out, will try again next run",
+                      file=sys.stderr)
+        else:
+            print("watcher: no ALERT_BOT_TOKEN/ALERT_CHAT_ID set, nobody was told",
+                  file=sys.stderr)
+            announced = False
 
-    keepalive = previous.get("keepalive", 0)
-    writing = should_commit(changed, now - keepalive)
+    # An undelivered alert has to be retried, so it is written down every time rather than
+    # only when the keepalive is due - otherwise the retry would wait three weeks.
+    writing = should_commit(changed, now - previous.get("keepalive", 0)) or not announced
     if writing:
-        save_state(state_path, {
-            "status": current,
-            "changed_at": int(now) if changed else previous.get("changed_at", int(now)),
-            "keepalive": int(now),
-        })
+        _record(state_path, current,
+                int(now) if current != was else previous.get("changed_at", int(now)),
+                now, announced)
 
-    # Read by the workflow to decide whether there is anything to commit.
-    output = os.environ.get("GITHUB_OUTPUT")
-    if output:
-        with open(output, "a", encoding="utf-8") as f:
-            f.write(f"commit={'true' if writing else 'false'}\n")
-
+    _tell_workflow(writing)
     return 0
 
 

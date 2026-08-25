@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -135,3 +136,142 @@ class TestPastedSecrets:
         monkeypatch.delenv("GIST_TOKEN", raising=False)
 
         assert watcher.setting("GIST_TOKEN") == ""
+
+
+class TestAnUndeliveredAlarmIsNotAnAlarm:
+    """The failure a review caught and a live test had already demonstrated: the state was
+    written as announced whether or not the message left, so a transient delivery failure
+    silenced the whole outage."""
+
+    def test_a_failed_send_is_not_remembered_as_announced(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat", lambda *a, **kw: "1 ok")
+        monkeypatch.setattr(watcher, "send_telegram", lambda *a, **kw: False)
+
+        watcher.main()
+
+        saved = watcher.load_state(state)
+        assert saved["status"] == watcher.DOWN
+        assert saved["announced"] is False
+
+    def test_the_next_run_tries_again(self, monkeypatch):
+        """Without this the outage is reported to nobody for as long as it lasts: the
+        state already says 'down', so nothing has changed, so nothing is said."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN, "keepalive": time.time(),
+                                   "announced": False})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat", lambda *a, **kw: "1 ok")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        watcher.main()
+
+        assert len(sent) == 1
+        assert watcher.load_state(state)["announced"] is True
+
+    def test_a_delivered_alarm_is_not_repeated(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN, "keepalive": time.time(),
+                                   "announced": True})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat", lambda *a, **kw: "1 ok")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        watcher.main()
+
+        assert sent == []
+
+
+class TestAGarbledHeartbeatRaisesTheAlarm:
+    def test_nonsense_in_the_file_counts_as_down(self, monkeypatch):
+        """The server died mid-write, or its disk filled. That is the case this exists
+        for - and it used to end in a silent exit code."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat", lambda *a, **kw: "мусор")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        assert watcher.main() == 0
+        assert len(sent) == 1
+        assert watcher.load_state(state)["status"] == watcher.DOWN
+
+
+class TestTheWatchmanKeepsShowingUp:
+    def test_a_long_outage_still_produces_a_keepalive_commit(self, monkeypatch):
+        """GitHub disables a schedule after 60 quiet days. A fault that blocks every
+        commit - a deleted gist, an expired token - would otherwise switch the alarm off
+        precisely because something was wrong."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.OK,
+                                   "keepalive": time.time() - 30 * 24 * 3600,
+                                   "announced": True})
+        output = os.path.join(directory, "gh-output")
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("GITHUB_OUTPUT", output)
+
+        def unreachable(*args, **kwargs):
+            raise OSError("github is down")
+
+        monkeypatch.setattr(watcher, "read_beat", unreachable)
+
+        assert watcher.main() == 1
+        with open(output, encoding="utf-8") as f:
+            assert "commit=true" in f.read()
+
+    def test_a_short_outage_writes_nothing(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.OK, "keepalive": time.time(),
+                                   "announced": True})
+        output = os.path.join(directory, "gh-output")
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("GITHUB_OUTPUT", output)
+
+        def unreachable(*args, **kwargs):
+            raise OSError("github is down")
+
+        monkeypatch.setattr(watcher, "read_beat", unreachable)
+
+        watcher.main()
+
+        with open(output, encoding="utf-8") as f:
+            assert "commit=false" in f.read()
+
+
+class TestTheTokenStaysOutOfTheLog:
+    def test_only_the_exception_type_is_printed(self, monkeypatch, capsys):
+        """A malformed URL is reported by quoting the URL back, and the URL carries the
+        bot token."""
+        def boom(*args, **kwargs):
+            raise ValueError("URL can't contain control characters. '/bot123:SECRET/send'")
+
+        monkeypatch.setattr(watcher.urllib.request, "urlopen", boom)
+
+        assert watcher.send_telegram("123:SECRET", "42", "текст") is False
+        assert "SECRET" not in capsys.readouterr().err
