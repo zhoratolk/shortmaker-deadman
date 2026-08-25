@@ -1,0 +1,46 @@
+name: deadman
+
+# Runs on someone else's electricity, which is the entire point: the machine being watched
+# cannot report its own death. Every quarter of an hour this looks at how old the server's
+# heartbeat is and says something only when the answer changes.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# The job writes state.json back so it remembers whether it has already raised the alarm,
+# and so the repository keeps showing activity - GitHub retires scheduled workflows in a
+# repository untouched for 60 days.
+permissions:
+  contents: write
+
+# Two overlapping runs would both read the same state and both send the same message.
+concurrency:
+  group: deadman
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the heartbeat
+        id: check
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          ALERT_BOT_TOKEN: ${{ secrets.ALERT_BOT_TOKEN }}
+          ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
+        run: python3 watcher.py
+
+      - name: Remember what was seen
+        if: steps.check.outputs.commit == 'true'
+        run: |
+          git config user.name "deadman"
+          git config user.email "deadman@users.noreply.github.com"
+          git add state.json
+          # Nothing to commit is a normal outcome of a race with a manual run, not a failure.
+          git diff --cached --quiet || git commit -m "state: $(python3 -c "import json;print(json.load(open('state.json'))['status'])")"
+          git push
