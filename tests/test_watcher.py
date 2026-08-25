@@ -115,3 +115,23 @@ class TestTheStateFile:
         assert watcher.load_state(path) == {"status": "down", "keepalive": 5}
         with open(path, encoding="utf-8") as f:
             assert json.load(f)["status"] == "down"
+
+
+class TestPastedSecrets:
+    def test_a_trailing_newline_is_removed(self, monkeypatch):
+        """Secrets are typed into a web form and saved with whatever came along. A token
+        with a newline builds a URL urllib refuses outright - found on the first real
+        alarm this raised, which noticed the server was gone and then could not say so."""
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "123:abc\n")
+
+        assert watcher.setting("ALERT_BOT_TOKEN") == "123:abc"
+
+    def test_surrounding_spaces_go_too(self, monkeypatch):
+        monkeypatch.setenv("GIST_ID", "  deadbeef  ")
+
+        assert watcher.setting("GIST_ID") == "deadbeef"
+
+    def test_an_unset_value_is_empty(self, monkeypatch):
+        monkeypatch.delenv("GIST_TOKEN", raising=False)
+
+        assert watcher.setting("GIST_TOKEN") == ""

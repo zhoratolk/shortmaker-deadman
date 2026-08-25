@@ -37,6 +37,17 @@ UNHEALTHY = "unhealthy"
 OK = "ok"
 
 
+def setting(name: str) -> str:
+    """A secret's value, without the whitespace that pasting brings along.
+
+    Secrets are typed into a web form, and one saved with a trailing newline builds a URL
+    urllib refuses outright: "URL can't contain control characters". Found on the first
+    real alarm this ever raised - it correctly noticed the server was gone, and then could
+    not say so, which is the one failure that makes the whole thing pointless.
+    """
+    return os.environ.get(name, "").strip()
+
+
 def parse_beat(text: str) -> tuple[int, str]:
     """The timestamp and verdict the server last wrote.
 
@@ -150,10 +161,10 @@ def save_state(path: str, state: dict) -> None:
 
 
 def main() -> int:
-    gist_id = os.environ.get("GIST_ID", "")
-    gist_token = os.environ.get("GIST_TOKEN", "")
-    bot_token = os.environ.get("ALERT_BOT_TOKEN", "")
-    chat_id = os.environ.get("ALERT_CHAT_ID", "")
+    gist_id = setting("GIST_ID")
+    gist_token = setting("GIST_TOKEN")
+    bot_token = setting("ALERT_BOT_TOKEN")
+    chat_id = setting("ALERT_CHAT_ID")
     state_path = os.environ.get("STATE_FILE", "state.json")
     now = time.time()
 
