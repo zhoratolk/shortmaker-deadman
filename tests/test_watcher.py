@@ -437,20 +437,21 @@ class TestTheWatchmanKeepsShowingUp:
         with open(output, encoding="utf-8") as f:
             assert "commit=true" in f.read()
 
-    def test_a_short_outage_writes_nothing(self, monkeypatch):
+    def test_a_blind_spell_stops_writing_once_it_has_been_reported(self, monkeypatch):
+        """The count of blind runs has to be written down or it could never reach the
+        threshold - but writing every run is a commit every fifteen minutes for as long
+        as the fault lasts. It stops once the message is out."""
         directory = tempfile.mkdtemp()
         state = os.path.join(directory, "state.json")
         watcher.save_state(state, {"status": watcher.OK, "keepalive": time.time(),
-                                   "announced": True})
+                                   "announced": True,
+                                   "blind": watcher.BLIND_RUNS_BEFORE_ALERT,
+                                   "blind_told": True})
         output = os.path.join(directory, "gh-output")
         monkeypatch.setenv("STATE_FILE", state)
         monkeypatch.setenv("GIST_ID", "abc")
         monkeypatch.setenv("GITHUB_OUTPUT", output)
-
-        def unreachable(*args, **kwargs):
-            raise OSError("github is down")
-
-        monkeypatch.setattr(watcher, "read_beat", unreachable)
+        monkeypatch.setattr(watcher, "read_beat", _unreachable)
 
         watcher.main()
 
@@ -469,3 +470,103 @@ class TestTheTokenStaysOutOfTheLog:
 
         assert watcher.send_telegram("123:SECRET", "42", "текст") is False
         assert "SECRET" not in capsys.readouterr().err
+
+def _unreachable(*args, **kwargs):
+    raise OSError("github is down")
+
+
+class TestBlindnessIsOurOwnFailure:
+    """A watchman that cannot see says so. Silence from a deadman switch is
+    indistinguishable from good news, and the causes here - a deleted gist, an expired
+    token, a rate limit shared with every other job on the runner - last until someone
+    acts on them."""
+
+    def _blind_run(self, monkeypatch, state, previous, sent):
+        watcher.save_state(state, previous)
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat", _unreachable)
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+        watcher.main()
+        return watcher.load_state(state)
+
+    def test_a_single_failure_is_counted_but_not_announced(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        sent = []
+
+        saved = self._blind_run(monkeypatch, state,
+                                {"status": watcher.OK, "keepalive": time.time(),
+                                 "announced": True}, sent)
+
+        assert saved["blind"] == 1
+        assert sent == []
+
+    def test_an_hour_of_blindness_is_reported_once(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        sent = []
+        previous = {"status": watcher.OK, "keepalive": time.time(), "announced": True,
+                    "blind": watcher.BLIND_RUNS_BEFORE_ALERT - 1}
+
+        saved = self._blind_run(monkeypatch, state, previous, sent)
+
+        assert len(sent) == 1
+        assert "не видит" in sent[0]
+        assert saved["blind_told"] is True
+
+        # The next failure must not repeat it: a message every quarter of an hour is how
+        # a chat gets muted, and a muted chat is the same as no alarm at all. Nor is the
+        # state rewritten - the count has done its job, and further writes would be a
+        # commit every fifteen minutes for as long as the fault lasts.
+        saved = self._blind_run(monkeypatch, state, saved, sent)
+        assert len(sent) == 1
+        assert saved["blind"] == watcher.BLIND_RUNS_BEFORE_ALERT
+
+    def test_reading_the_gist_again_clears_the_spell(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.OK, "keepalive": 0,
+                                   "announced": True, "blind": 9, "blind_told": True})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setattr(watcher, "read_beat",
+                            lambda *a, **kw: f"{int(time.time())} ok")
+
+        watcher.main()
+
+        saved = watcher.load_state(state)
+        assert saved["blind"] == 0
+        assert saved["blind_told"] is False
+
+    def test_the_alarm_about_the_server_is_not_lost_while_blind(self, monkeypatch):
+        """The blind path owns nothing but its own counter: an undelivered alarm about
+        the server has to survive it, or a fault on both sides at once loses the one
+        that matters."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        sent = []
+        previous = {"status": watcher.DOWN, "changed_at": int(time.time()) - 3600,
+                    "keepalive": time.time(), "announced": False}
+
+        saved = self._blind_run(monkeypatch, state, previous, sent)
+
+        assert saved["status"] == watcher.DOWN
+        assert saved["announced"] is False
+
+
+class TestTheReasonIsNamed:
+    def test_an_http_failure_carries_its_status(self):
+        """A type name cannot tell a 403 rate limit from a DNS failure, and those call
+        for opposite responses."""
+        import urllib.error
+
+        error = urllib.error.HTTPError("https://api.github.com/gists/x", 403,
+                                       "rate limited", {}, None)
+        assert watcher._why(error) == "HTTPError 403"
+
+    def test_a_failure_without_one_is_named_by_type_alone(self):
+        assert watcher._why(OSError("no route to host")) == "OSError"

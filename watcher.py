@@ -34,9 +34,21 @@ SILENCE_SECONDS = 30 * 60
 # a watchman who stopped showing up without telling anyone.
 KEEPALIVE_SECONDS = 21 * 24 * 3600
 
+# How often the workflow's schedule fires, used only to turn a count of failed runs into
+# a span of time a person can read. Kept beside the cron line it mirrors.
+RUN_MINUTES = 15
+
 DOWN = "down"
 UNHEALTHY = "unhealthy"
 OK = "ok"
+
+
+# How many consecutive failures to read the gist before saying so. Four quarter-hour
+# runs is an hour: long enough that a transient rate limit or a GitHub hiccup passes
+# unmentioned, short enough that an hour is the upper bound on how long this can be
+# blind without anyone knowing. Telegram is a different service from the GitHub API and
+# usually still works, which is what makes the message possible at all.
+BLIND_RUNS_BEFORE_ALERT = 4
 
 
 class BeatMissing(Exception):
@@ -164,6 +176,23 @@ def recovered_message(minutes_late: float | None) -> str:
     return "\n".join(lines)
 
 
+def blind_message(runs: int, minutes: float) -> str:
+    """Said about ourselves, not about the server.
+
+    Deliberately not phrased as an outage: the server may be perfectly fine and this
+    watchman simply cannot see it. Without this the failure is silent for as long as it
+    lasts - a deleted gist, an expired token, a shared-runner rate limit - and silence
+    from a deadman switch is indistinguishable from good news.
+    """
+    return (
+        "❓ Сторож не видит сердцебиение.\n"
+        f"{runs} попытки подряд не удалось прочитать gist — это примерно "
+        f"{minutes:.0f} мин вслепую.\n"
+        "Причина на нашей стороне: gist удалён, токен протух или GitHub ограничил "
+        "запросы. Про сам сервер это НИЧЕГО не говорит."
+    )
+
+
 def should_announce(previous: str, current: str) -> bool:
     """Alerts fire on change.
 
@@ -178,6 +207,17 @@ def should_commit(state_changed: bool, keepalive_age: float,
     return state_changed or keepalive_age > window
 
 
+def _why(error: Exception) -> str:
+    """The exception type, plus the HTTP status when there is one.
+
+    The type alone cannot tell a 403 rate limit from a DNS failure, and those call for
+    opposite responses. The status code is not a secret; the exception's message can be,
+    since urllib reports a malformed URL by quoting the whole URL back.
+    """
+    code = getattr(error, "code", None)
+    return f"{type(error).__name__} {code}" if code is not None else type(error).__name__
+
+
 def send_telegram(token: str, chat_id: str, text: str) -> bool:
     body = urllib.parse.urlencode({
         "chat_id": chat_id, "text": text, "disable_web_page_preview": "true",
@@ -189,11 +229,17 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
         with urllib.request.urlopen(request, timeout=30) as response:
             return response.status == 200
     except Exception as e:
-        # The exception type only, never its message: a malformed URL is reported by
-        # quoting the whole URL back, and the whole URL contains the bot token. Actions
-        # masks known secrets in its own log, but stderr is copied into artifacts and
-        # pasted into chats where nothing masks anything.
-        print(f"watcher: could not reach Telegram: {type(e).__name__}", file=sys.stderr)
+        # The type and the status code only, never the message: a malformed URL is
+        # reported by quoting the whole URL back, and the whole URL contains the bot
+        # token. Actions masks known secrets in its own log, but stderr is copied into
+        # artifacts and pasted into chats where nothing masks anything.
+        print(f"watcher: could not reach Telegram: {_why(e)}", file=sys.stderr)
+        # A wrong token or a chat this bot was never added to answers the same way every
+        # time, forever, and the retry it triggers writes state on every run. Saying so
+        # is the difference between a fault someone fixes and one that just repeats.
+        if getattr(e, "code", None) in (401, 403, 404):
+            print("watcher: that is a configuration error - the token or the chat id is "
+                  "wrong, and it will not pass on its own", file=sys.stderr)
         return False
 
 
@@ -212,7 +258,7 @@ def save_state(path: str, state: dict) -> None:
 
 
 def _record(state_path: str, status: str, changed_at: int, now: float,
-            announced: bool) -> None:
+            announced: bool, blind: int = 0, blind_told: bool = False) -> None:
     save_state(state_path, {
         "status": status,
         "changed_at": changed_at,
@@ -221,6 +267,11 @@ def _record(state_path: str, status: str, changed_at: int, now: float,
         # message never left means the next run sees no change and says nothing - the
         # outage goes unreported for as long as it lasts.
         "announced": announced,
+        # How many runs in a row could not read the gist, and whether that was reported.
+        # Defaulted to a clean slate so every caller that did read the gist clears the
+        # spell without having to remember to.
+        "blind": blind,
+        "blind_told": blind_told,
     })
 
 
@@ -235,8 +286,45 @@ def _keepalive_only(state_path: str, previous: dict, now: float) -> bool:
     if now - previous.get("keepalive", 0) <= KEEPALIVE_SECONDS:
         return False
     _record(state_path, previous.get("status", OK), previous.get("changed_at", int(now)),
-            now, previous.get("announced", True))
+            now, previous.get("announced", True),
+            previous.get("blind", 0), previous.get("blind_told", False))
     return True
+
+
+def _note_blindness(state_path: str, previous: dict, now: float,
+                    bot_token: str, chat_id: str) -> bool:
+    """Counts a run that could not read the gist, and says so once it has lasted an hour.
+
+    The count has to be written down on this path or it could never reach the threshold -
+    but writing every run means a commit every fifteen minutes for as long as the fault
+    lasts, so it stops once the message is out and falls back to the ordinary keepalive
+    cadence. Everything the other paths own - the server's state and whether its alarm
+    was delivered - is carried through untouched.
+    """
+    blind = previous.get("blind", 0) + 1
+    told = previous.get("blind_told", False)
+
+    if blind >= BLIND_RUNS_BEFORE_ALERT and not told:
+        if bot_token and chat_id:
+            told = send_telegram(
+                bot_token, chat_id, blind_message(blind, blind * RUN_MINUTES)
+            )
+            if not told:
+                print("watcher: could not report the blindness either", file=sys.stderr)
+        else:
+            print("watcher: blind and no ALERT_BOT_TOKEN/ALERT_CHAT_ID to say so",
+                  file=sys.stderr)
+
+    writing = (
+        blind <= BLIND_RUNS_BEFORE_ALERT
+        or not told
+        or now - previous.get("keepalive", 0) > KEEPALIVE_SECONDS
+    )
+    if writing:
+        _record(state_path, previous.get("status", OK),
+                previous.get("changed_at", int(now)), now,
+                previous.get("announced", True), blind, told)
+    return writing
 
 
 def _tell_workflow(writing: bool) -> None:
@@ -273,8 +361,8 @@ def main() -> int:
               file=sys.stderr)
         verdict, age, current = "missing", None, DOWN
     except Exception as e:
-        print(f"watcher: cannot reach the heartbeat: {type(e).__name__}", file=sys.stderr)
-        _tell_workflow(_keepalive_only(state_path, previous, now))
+        print(f"watcher: cannot reach the heartbeat: {_why(e)}", file=sys.stderr)
+        _tell_workflow(_note_blindness(state_path, previous, now, bot_token, chat_id))
         return 1
     else:
         try:
