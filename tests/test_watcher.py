@@ -505,6 +505,34 @@ class TestBlindnessIsOurOwnFailure:
         assert saved["blind"] == 1
         assert sent == []
 
+    def test_the_span_is_measured_not_derived_from_the_schedule(self, monkeypatch):
+        """The cron line asks for every fifteen minutes and GitHub delivers 30 to 160
+        minutes apart, so a count of runs says nothing about how long this has lasted."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        sent = []
+        started = time.time() - 200 * 60
+        previous = {"status": watcher.OK, "keepalive": time.time(), "announced": True,
+                    "blind": watcher.BLIND_RUNS_BEFORE_ALERT - 1,
+                    "blind_since": started}
+
+        self._blind_run(monkeypatch, state, previous, sent)
+
+        assert len(sent) == 1
+        assert "200 мин" in sent[0]
+
+    def test_the_first_blind_run_starts_the_clock(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        sent = []
+
+        saved = self._blind_run(monkeypatch, state,
+                                {"status": watcher.OK, "keepalive": time.time(),
+                                 "announced": True}, sent)
+
+        assert saved["blind_since"] is not None
+        assert abs(saved["blind_since"] - time.time()) < 60
+
     def test_an_hour_of_blindness_is_reported_once(self, monkeypatch):
         directory = tempfile.mkdtemp()
         state = os.path.join(directory, "state.json")
@@ -541,6 +569,7 @@ class TestBlindnessIsOurOwnFailure:
         saved = watcher.load_state(state)
         assert saved["blind"] == 0
         assert saved["blind_told"] is False
+        assert saved["blind_since"] is None
 
     def test_the_alarm_about_the_server_is_not_lost_while_blind(self, monkeypatch):
         """The blind path owns nothing but its own counter: an undelivered alarm about

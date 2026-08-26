@@ -34,9 +34,11 @@ SILENCE_SECONDS = 30 * 60
 # a watchman who stopped showing up without telling anyone.
 KEEPALIVE_SECONDS = 21 * 24 * 3600
 
-# How often the workflow's schedule fires, used only to turn a count of failed runs into
-# a span of time a person can read. Kept beside the cron line it mirrors.
-RUN_MINUTES = 15
+# Measured, never assumed. The workflow asks for every fifteen minutes; GitHub throttles
+# scheduled runs and actually delivers them 30 to 160 minutes apart (observed over a day
+# of real runs on this repository). Any message that turned a count of runs into a span
+# of time using the cron line would understate the truth by up to a factor of ten, so the
+# blind spell carries the wall-clock moment it began instead.
 
 DOWN = "down"
 UNHEALTHY = "unhealthy"
@@ -176,7 +178,7 @@ def recovered_message(minutes_late: float | None) -> str:
     return "\n".join(lines)
 
 
-def blind_message(runs: int, minutes: float) -> str:
+def blind_message(runs: int, minutes: float | None) -> str:
     """Said about ourselves, not about the server.
 
     Deliberately not phrased as an outage: the server may be perfectly fine and this
@@ -184,10 +186,10 @@ def blind_message(runs: int, minutes: float) -> str:
     lasts - a deleted gist, an expired token, a shared-runner rate limit - and silence
     from a deadman switch is indistinguishable from good news.
     """
+    span = "" if minutes is None else f" — это {minutes:.0f} мин вслепую"
     return (
         "❓ Сторож не видит сердцебиение.\n"
-        f"{runs} попытки подряд не удалось прочитать gist — это примерно "
-        f"{minutes:.0f} мин вслепую.\n"
+        f"{runs} проверки подряд не смогли прочитать gist{span}.\n"
         "Причина на нашей стороне: gist удалён, токен протух или GitHub ограничил "
         "запросы. Про сам сервер это НИЧЕГО не говорит."
     )
@@ -258,7 +260,8 @@ def save_state(path: str, state: dict) -> None:
 
 
 def _record(state_path: str, status: str, changed_at: int, now: float,
-            announced: bool, blind: int = 0, blind_told: bool = False) -> None:
+            announced: bool, blind: int = 0, blind_told: bool = False,
+            blind_since: float | None = None) -> None:
     save_state(state_path, {
         "status": status,
         "changed_at": changed_at,
@@ -267,11 +270,14 @@ def _record(state_path: str, status: str, changed_at: int, now: float,
         # message never left means the next run sees no change and says nothing - the
         # outage goes unreported for as long as it lasts.
         "announced": announced,
-        # How many runs in a row could not read the gist, and whether that was reported.
-        # Defaulted to a clean slate so every caller that did read the gist clears the
-        # spell without having to remember to.
+        # How many runs in a row could not read the gist, when the spell started, and
+        # whether it was reported. Defaulted to a clean slate so every caller that did
+        # read the gist clears the spell without having to remember to. The moment is
+        # kept because the count alone cannot be turned into a span of time: GitHub
+        # delivers this schedule when it feels like it, not every fifteen minutes.
         "blind": blind,
         "blind_told": blind_told,
+        "blind_since": blind_since,
     })
 
 
@@ -287,7 +293,8 @@ def _keepalive_only(state_path: str, previous: dict, now: float) -> bool:
         return False
     _record(state_path, previous.get("status", OK), previous.get("changed_at", int(now)),
             now, previous.get("announced", True),
-            previous.get("blind", 0), previous.get("blind_told", False))
+            previous.get("blind", 0), previous.get("blind_told", False),
+            previous.get("blind_since"))
     return True
 
 
@@ -303,12 +310,12 @@ def _note_blindness(state_path: str, previous: dict, now: float,
     """
     blind = previous.get("blind", 0) + 1
     told = previous.get("blind_told", False)
+    since = previous.get("blind_since") or now
+    minutes = (now - since) / 60 if since < now else None
 
     if blind >= BLIND_RUNS_BEFORE_ALERT and not told:
         if bot_token and chat_id:
-            told = send_telegram(
-                bot_token, chat_id, blind_message(blind, blind * RUN_MINUTES)
-            )
+            told = send_telegram(bot_token, chat_id, blind_message(blind, minutes))
             if not told:
                 print("watcher: could not report the blindness either", file=sys.stderr)
         else:
@@ -323,7 +330,7 @@ def _note_blindness(state_path: str, previous: dict, now: float,
     if writing:
         _record(state_path, previous.get("status", OK),
                 previous.get("changed_at", int(now)), now,
-                previous.get("announced", True), blind, told)
+                previous.get("announced", True), blind, told, since)
     return writing
 
 
