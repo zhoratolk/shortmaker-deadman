@@ -13,6 +13,8 @@ computer that is not in the same room, and a scheduled workflow is one.
 Standard library only: this runs on a bare runner with nothing installed.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -35,6 +37,16 @@ KEEPALIVE_SECONDS = 21 * 24 * 3600
 DOWN = "down"
 UNHEALTHY = "unhealthy"
 OK = "ok"
+
+
+class BeatMissing(Exception):
+    """The gist answered, but the heartbeat file in it is gone.
+
+    Its own exception because the meaning is the opposite of a network failure: the
+    contents of the gist belong to the server, so a vanished file is its silence - the
+    case this whole thing exists for - while an unreachable GitHub is our silence, which
+    must page nobody.
+    """
 
 
 def setting(name: str) -> str:
@@ -67,6 +79,9 @@ def read_beat(gist_id: str, token: str = "") -> str:
 
     A secret gist is readable by anyone holding its id, so no token is needed here. One is
     accepted anyway for the case where the gist is made private later.
+
+    Raises BeatMissing when the gist answers but the file in it is gone: the server owns
+    those contents, so their absence is its silence, not a failure to reach GitHub.
     """
     headers = {
         "Accept": "application/vnd.github+json",
@@ -85,7 +100,7 @@ def read_beat(gist_id: str, token: str = "") -> str:
     files = payload.get("files") or {}
     entry = files.get(BEAT_FILE)
     if not entry:
-        raise ValueError(f"the gist has no {BEAT_FILE}")
+        raise BeatMissing(f"the gist has no {BEAT_FILE}")
     return entry.get("content") or ""
 
 
@@ -100,8 +115,23 @@ def classify(beat_age: float, verdict: str, silence: float = SILENCE_SECONDS) ->
     return OK if verdict == OK else UNHEALTHY
 
 
-def message(state: str, minutes_quiet: float) -> str:
+def message(state: str, minutes_quiet: float | None) -> str:
+    """The text for a state change, or for a retry of one nobody received.
+
+    An age of None means the heartbeat gave us nothing to measure - the file is empty,
+    unreadable, or gone. Quoting zero minutes there would claim a fresh signal from a
+    machine nothing was heard from, and a self-contradicting alarm teaches its reader to
+    hunt for tricks instead of acting.
+    """
     if state == DOWN:
+        if minutes_quiet is None:
+            return (
+                "🚨 Сервер молчит.\n"
+                "Файл сердцебиения пустой, не читается или исчез — возраст последнего "
+                "сигнала неизвестен.\n"
+                "Похоже на отключение света, сети или зависание машины — "
+                "сам он об этом сообщить не может."
+            )
         return (
             "🚨 Сервер молчит.\n"
             f"Последний сигнал {minutes_quiet:.0f} мин назад.\n"
@@ -115,6 +145,23 @@ def message(state: str, minutes_quiet: float) -> str:
             "если их нет, у него не работает связь с Telegram."
         )
     return "✅ Сервер снова на связи."
+
+
+def recovered_message(minutes_late: float | None) -> str:
+    """The text for trouble that ended before its alarm got through.
+
+    The ordinary 'all clear' would read as confirmation of a system the person never saw
+    fail, and the outage - a reboot, a brownout - becomes invisible. Saying it late is
+    the point: late beats never.
+    """
+    lines = ["⚠️ Проблема была, но прошла сама, пока тревога не могла уйти."]
+    if minutes_late is not None:
+        # When it started, not how long it lasted: the moment it ended is not written
+        # down anywhere, and this same message is re-sent until it gets through, so a
+        # duration would grow with every failed attempt.
+        lines.append(f"Началась {minutes_late:.0f} мин назад.")
+    lines.append("Сообщаю задним числом, чтобы сбой не остался незамеченным.")
+    return "\n".join(lines)
 
 
 def should_announce(previous: str, current: str) -> bool:
@@ -215,24 +262,29 @@ def main() -> int:
     previous = load_state(state_path)
 
     # Reading the gist and reading what is in it are different failures. Not reaching
-    # GitHub is our silence, and claiming a power cut on it would be a lie. A file we did
-    # read whose contents are nonsense is the server's silence: it died mid-write, or its
-    # disk filled - exactly the case this was built for, so it counts as down.
+    # GitHub is our silence, and claiming a power cut on it would be a lie. A file whose
+    # contents are nonsense - or that is gone altogether, which only the server can do -
+    # is the server's silence: it died mid-write, its disk filled, or it never came back.
+    # Exactly the case this was built for, so both count as down.
     try:
         raw = read_beat(gist_id, gist_token)
+    except BeatMissing as e:
+        print(f"watcher: the heartbeat file is gone, treating it as down: {e}",
+              file=sys.stderr)
+        verdict, age, current = "missing", None, DOWN
     except Exception as e:
         print(f"watcher: cannot reach the heartbeat: {type(e).__name__}", file=sys.stderr)
         _tell_workflow(_keepalive_only(state_path, previous, now))
         return 1
-
-    try:
-        stamp, verdict = parse_beat(raw)
-        age = max(0.0, now - stamp)
-        current = classify(age, verdict)
-    except ValueError as e:
-        print(f"watcher: the heartbeat is unreadable, treating it as down: {e}",
-              file=sys.stderr)
-        stamp, verdict, age, current = 0, "unreadable", 0.0, DOWN
+    else:
+        try:
+            stamp, verdict = parse_beat(raw)
+            age = max(0.0, now - stamp)
+            current = classify(age, verdict)
+        except ValueError as e:
+            print(f"watcher: the heartbeat is unreadable, treating it as down: {e}",
+                  file=sys.stderr)
+            verdict, age, current = "unreadable", None, DOWN
 
     was = previous.get("status", OK)
     # An alarm that was never delivered is not an alarm. Re-announcing the same state is
@@ -240,12 +292,32 @@ def main() -> int:
     # heard this one yet.
     changed = should_announce(was, current) or not previous.get("announced", True)
 
-    print(f"watcher: last beat {age / 60:.1f} min ago, verdict '{verdict}', state '{current}'")
+    minutes_quiet = None if age is None else age / 60
+    if minutes_quiet is None:
+        print(f"watcher: last beat unreadable, verdict '{verdict}', state '{current}'")
+    else:
+        print(f"watcher: last beat {minutes_quiet:.1f} min ago, verdict '{verdict}', "
+              f"state '{current}'")
+
+    # Trouble that ends before its alarm got through must not send the ordinary 'all
+    # clear': that confirms a system the person never saw fail, and the outage - a
+    # reboot, a brownout - becomes invisible. 'announced is False' is the memory that
+    # nobody has heard of it yet; an old state without the field counts as delivered.
+    unheard = was != OK and current == OK and previous.get("announced") is False
+    lasted = None
+    if unheard:
+        started = previous.get("changed_at")
+        if started is not None:
+            lasted = max(0.0, (now - started) / 60)
 
     announced = True
     if changed:
         if bot_token and chat_id:
-            announced = send_telegram(bot_token, chat_id, message(current, age / 60))
+            if unheard:
+                text = recovered_message(lasted)
+            else:
+                text = message(current, minutes_quiet)
+            announced = send_telegram(bot_token, chat_id, text)
             if not announced:
                 print("watcher: the alert did not go out, will try again next run",
                       file=sys.stderr)
@@ -258,9 +330,16 @@ def main() -> int:
     # only when the keepalive is due - otherwise the retry would wait three weeks.
     writing = should_commit(changed, now - previous.get("keepalive", 0)) or not announced
     if writing:
-        _record(state_path, current,
-                int(now) if current != was else previous.get("changed_at", int(now)),
-                now, announced)
+        # A recovery notice that did not get through must not be remembered as recovery.
+        # Written as OK, the next run would see no trouble left to report and send the
+        # plain "снова на связи" instead - and the outage nobody heard about would be
+        # gone for good. Held at the old state, the next run re-detects it and retries.
+        if unheard and not announced:
+            _record(state_path, was, previous.get("changed_at", int(now)), now, False)
+        else:
+            _record(state_path, current,
+                    int(now) if current != was else previous.get("changed_at", int(now)),
+                    now, announced)
 
     _tell_workflow(writing)
     return 0

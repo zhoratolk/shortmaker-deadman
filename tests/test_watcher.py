@@ -39,6 +39,38 @@ class TestReadingWhatTheServerWrote:
             watcher.parse_beat("hello there")
 
 
+class TestReadingTheGist:
+    @staticmethod
+    def _response(files):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"files": files}).encode()
+
+        return FakeResponse()
+
+    def test_a_gist_without_the_beat_file_raises_beat_missing(self, monkeypatch):
+        """The absence has to be distinguishable from not reaching GitHub at all: only
+        the server can remove the file, so only one of the two may page anybody."""
+        monkeypatch.setattr(watcher.urllib.request, "urlopen",
+                            lambda *a, **kw: self._response({}))
+
+        with pytest.raises(watcher.BeatMissing):
+            watcher.read_beat("abc")
+
+    def test_a_gist_with_the_beat_file_returns_its_contents(self, monkeypatch):
+        monkeypatch.setattr(
+            watcher.urllib.request, "urlopen",
+            lambda *a, **kw: self._response({"beat.txt": {"content": "1700000000 ok"}}))
+
+        assert watcher.read_beat("abc") == "1700000000 ok"
+
+
 class TestDecidingWhatIsGoingOn:
     def test_a_recent_healthy_beat_is_fine(self):
         assert watcher.classify(60, "ok") == watcher.OK
@@ -78,6 +110,17 @@ class TestWhenItSpeaks:
     def test_the_unhealthy_message_distinguishes_itself(self):
         text = watcher.message(watcher.UNHEALTHY, 1.0)
         assert "жив" in text
+
+
+class TestAnAgeNobodyCanKnow:
+    def test_the_down_message_admits_it_cannot_know(self):
+        """Quoting '0 мин назад' about a machine nothing was heard from contradicts the
+        alarm's own headline, and a self-contradicting alarm teaches its reader to hunt
+        for tricks instead of acting."""
+        text = watcher.message(watcher.DOWN, None)
+
+        assert "неизвестен" in text
+        assert "0 мин" not in text
 
 
 class TestStayingEmployed:
@@ -199,6 +242,129 @@ class TestAnUndeliveredAlarmIsNotAnAlarm:
         assert sent == []
 
 
+class TestTroubleThatEndedUnheard:
+    """A problem whose alarm never left - Telegram was down - and that was already over
+    by the next run. The ordinary 'all clear' would confirm a system the person never
+    saw fail, and the outage - a reboot, a brownout - becomes invisible."""
+
+    def test_recovery_after_an_undelivered_alarm_reports_the_outage(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN,
+                                   "changed_at": int(time.time()) - 47 * 60,
+                                   "keepalive": time.time(),
+                                   "announced": False})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat",
+                            lambda *a, **kw: f"{int(time.time())} ok")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        watcher.main()
+
+        assert len(sent) == 1
+        assert "47" in sent[0]
+        assert "снова на связи" not in sent[0]
+        saved = watcher.load_state(state)
+        assert saved["status"] == watcher.OK
+        assert saved["announced"] is True
+
+    def test_a_recovery_notice_that_did_not_get_through_is_retried_as_one(self, monkeypatch):
+        """Remembered as OK, the next run would find no trouble left to report and send
+        the plain all-clear - and the outage nobody heard about would be gone for good."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN,
+                                   "changed_at": int(time.time()) - 47 * 60,
+                                   "keepalive": time.time(),
+                                   "announced": False})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat",
+                            lambda *a, **kw: f"{int(time.time())} ok")
+
+        sent = []
+
+        def failing(token, chat, text):
+            sent.append(text)
+            return False
+
+        monkeypatch.setattr(watcher, "send_telegram", failing)
+        watcher.main()
+
+        saved = watcher.load_state(state)
+        assert saved["status"] == watcher.DOWN
+        assert saved["announced"] is False
+
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+        watcher.main()
+
+        assert len(sent) == 2
+        assert "снова на связи" not in sent[1]
+        assert "прошла сама" in sent[1]
+        assert watcher.load_state(state)["status"] == watcher.OK
+
+    def test_recovery_after_a_delivered_alarm_is_the_usual_all_clear(self, monkeypatch):
+        """Once the problem was reported, coming back needs only the short line."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN,
+                                   "changed_at": int(time.time()) - 47 * 60,
+                                   "keepalive": time.time(),
+                                   "announced": True})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat",
+                            lambda *a, **kw: f"{int(time.time())} ok")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        watcher.main()
+
+        assert sent == ["✅ Сервер снова на связи."]
+
+    def test_an_old_state_without_delivery_fields_takes_the_usual_path(self, monkeypatch):
+        """States written before 'announced' existed say nothing about delivery; assuming
+        delivered keeps them off the recovery path instead of crashing on it."""
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        watcher.save_state(state, {"status": watcher.DOWN, "keepalive": time.time()})
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+        monkeypatch.setattr(watcher, "read_beat",
+                            lambda *a, **kw: f"{int(time.time())} ok")
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        watcher.main()
+
+        assert sent == ["✅ Сервер снова на связи."]
+
+    def test_the_recovery_text_names_its_length(self):
+        assert "12" in watcher.recovered_message(12.0)
+
+    def test_the_recovery_text_survives_an_unknown_start(self):
+        """A hand-edited or ancient state may carry no changed_at; the message still has
+        to go out, minus any number it would only be guessing at."""
+        text = watcher.recovered_message(None)
+
+        assert "задним числом" in text
+        assert "мин" not in text
+
+
 class TestAGarbledHeartbeatRaisesTheAlarm:
     def test_nonsense_in_the_file_counts_as_down(self, monkeypatch):
         """The server died mid-write, or its disk filled. That is the case this exists
@@ -217,6 +383,34 @@ class TestAGarbledHeartbeatRaisesTheAlarm:
         assert watcher.main() == 0
         assert len(sent) == 1
         assert watcher.load_state(state)["status"] == watcher.DOWN
+
+
+class TestAVanishedHeartbeatFileRaisesTheAlarm:
+    """Only the server can delete or empty the beat file, so its absence is its silence -
+    the exact case this exists for. It used to exit 1 like a network failure and page
+    nobody, forever."""
+
+    def test_it_pages_instead_of_exiting_quietly(self, monkeypatch):
+        directory = tempfile.mkdtemp()
+        state = os.path.join(directory, "state.json")
+        monkeypatch.setenv("STATE_FILE", state)
+        monkeypatch.setenv("GIST_ID", "abc")
+        monkeypatch.setenv("ALERT_BOT_TOKEN", "1:tok")
+        monkeypatch.setenv("ALERT_CHAT_ID", "42")
+
+        def no_file(*args, **kwargs):
+            raise watcher.BeatMissing("the gist has no beat.txt")
+
+        monkeypatch.setattr(watcher, "read_beat", no_file)
+        sent = []
+        monkeypatch.setattr(watcher, "send_telegram",
+                            lambda token, chat, text: sent.append(text) or True)
+
+        assert watcher.main() == 0
+        assert len(sent) == 1
+        assert watcher.load_state(state)["status"] == watcher.DOWN
+        assert "0 мин" not in sent[0]
+        assert "неизвестен" in sent[0]
 
 
 class TestTheWatchmanKeepsShowingUp:

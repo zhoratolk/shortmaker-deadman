@@ -31,6 +31,12 @@ jobs:
         id: check
         env:
           GIST_ID: ${{ secrets.GIST_ID }}
+          # Anonymous GitHub API calls are limited to 60 an hour per address, and hosted
+          # runners share their addresses with everybody else's jobs - so the watchman
+          # goes blind at random moments, which is the one thing it must not do. The same
+          # gist-scope token the server already uses is enough; watcher.py reads it if it
+          # is there and works without it if it is not.
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           ALERT_BOT_TOKEN: ${{ secrets.ALERT_BOT_TOKEN }}
           ALERT_CHAT_ID: ${{ secrets.ALERT_CHAT_ID }}
         run: python3 watcher.py
