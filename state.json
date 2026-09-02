@@ -1,5 +1,9 @@
 {
-  "status": "ok",
-  "changed_at": 1787695260,
-  "keepalive": 1787695260
+  "status": "down",
+  "changed_at": 1788393142,
+  "keepalive": 1788393142,
+  "announced": true,
+  "blind": 0,
+  "blind_told": false,
+  "blind_since": null
 }
