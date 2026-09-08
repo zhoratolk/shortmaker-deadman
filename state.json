@@ -1,7 +1,7 @@
 {
-  "status": "down",
-  "changed_at": 1788827707,
-  "keepalive": 1788827707,
+  "status": "ok",
+  "changed_at": 1788844476,
+  "keepalive": 1788844476,
   "announced": true,
   "blind": 0,
   "blind_told": false,
