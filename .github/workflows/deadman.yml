@@ -3,9 +3,15 @@ name: deadman
 # Runs on someone else's electricity, which is the entire point: the machine being watched
 # cannot report its own death. Every quarter of an hour this looks at how old the server's
 # heartbeat is and says something only when the answer changes.
+#
+# Off the round minutes on purpose (2026-10-06). "*/15" asked for 96 runs a day and got
+# 3-6: GitHub's scheduler is best-effort and drops most runs at :00/:15/:30/:45, where
+# every schedule on the platform lands, and its own docs advise against the top of the
+# hour. That stretched the 30-minute silence threshold to an 8-hour blind spot. Minutes
+# 7/22/37/52 keep the same quarter-hour cadence away from the crowd.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 # The job writes state.json back so it remembers whether it has already raised the alarm,
