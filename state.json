@@ -1,7 +1,7 @@
 {
-  "status": "ok",
-  "changed_at": 1792541044,
-  "keepalive": 1792541044,
+  "status": "unhealthy",
+  "changed_at": 1793648951,
+  "keepalive": 1793648951,
   "announced": true,
   "blind": 0,
   "blind_told": false,
